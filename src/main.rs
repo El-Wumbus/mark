@@ -3,14 +3,20 @@
 //! For future editors:
 //! Remember to always output debugging messages to stderr and not to stdout.
 
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime};
 
 // TODO: parse .gitignore files and use them to ignore files by default
 //       https://git-scm.com/docs/gitignore
-//
-// TODO: Unarchival/unpacking
+
+lazy_static::lazy_static! {
+    pub static ref BROTLI_ENC_PARAMS: brotli::enc::BrotliEncoderParams = brotli::enc::BrotliEncoderParams::default();
+}
 
 #[derive(Default, Debug, Clone)]
 struct Opts {
@@ -87,7 +93,6 @@ fn main() {
         exit(1);
     };
 
-    dbg!(&opts);
     match subcommand.as_str() {
         "pack" => pack(opts, &positionals.collect::<Vec<_>>()),
         "unpack" => unpack(opts),
@@ -171,19 +176,32 @@ fn pack(opts: Opts, args: &[String]) {
             .read_to_end(&mut buf)
             .unwrap(),
         };
-
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let accessed = metadata
+            .accessed()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let f = FileHeaderRepr::new(
-            metadata.mode(),
-            opts.compression_method,
-            uncompressed_size as u64,
-            compressed_size as u64,
+            FileHeader {
+                modified,
+                accessed,
+                mode: metadata.mode(),
+                name_len: name.len() as u16,
+                data_compression: opts.compression_method as u8,
+                uncompressed_len: uncompressed_size as u64,
+                len: compressed_size as u64,
+            },
             name,
             buf,
         );
-        eprintln!(
-            "Writing: {} :: {{ mode = {:o}; compression = {:?}; uncompressed_len = {}; len = {} }}",
-            f.name, f.mode, f.data_compression, f.data_uncompressed_len, f.data_len
-        );
+        eprintln!("Writing: {} :: {:?}", f.name, f.inner,);
         f.write(output).unwrap();
     }
 }
@@ -195,7 +213,7 @@ fn read_archive(opts: Opts) {
     };
 
     let mut files = vec![];
-    
+
     let header = ArchiveHeader::read(input).unwrap();
     for _ in 0..header.file_count {
         let file = FileHeaderRepr::read(input, true).unwrap();
@@ -207,10 +225,7 @@ fn read_archive(opts: Opts) {
         header.version, header.file_count
     );
     for file in files.iter() {
-        eprintln!(
-            "{} :: {{ mode = {:o}; uncompressed_len = {}; compressed_len = {}; compression_method = {:?} }}",
-            file.name, file.mode, file.data_uncompressed_len, file.data_len,  file.data_compression,
-        );
+        eprintln!("{} :: {:?}", file.name, file.inner,);
     }
 }
 
@@ -223,7 +238,7 @@ fn unpack(opts: Opts) {
         Some(o) => std::path::PathBuf::from(o),
         None => std::env::current_dir().unwrap(),
     };
-    
+
     let header = ArchiveHeader::read(input).unwrap();
     for _ in 0..header.file_count {
         let file = FileHeaderRepr::read(input, false).unwrap();
@@ -238,16 +253,33 @@ fn unpack(opts: Opts) {
             }
         }
         let mut output = std::fs::File::create(&file_path).unwrap();
+        output
+            .set_permissions(std::fs::Permissions::from_mode(file.inner.mode))
+            .unwrap();
 
         eprintln!("Writing \"{}\" -> \"{}\"", file.name, file_path.display());
-        match file.data_compression {
+        let output = match DataCompression::try_from(file.inner.data_compression).unwrap() {
             DataCompression::None => {
                 output.write_all(&file.data).unwrap();
-            }, 
-            DataCompression::Brotli => {
-                brotli::DecompressorWriter::new(output, 8128).write_all(&file.data).unwrap();
+                output
             }
-        }
+            DataCompression::Brotli => {
+                let mut x = brotli::DecompressorWriter::new(output, 8128);
+                x.write_all(&file.data).unwrap();
+                x.into_inner().unwrap()
+            }
+        };
+
+        // set these after all the modifications are done so the changes stick
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(file.inner.modified);
+        let accessed = SystemTime::UNIX_EPOCH + Duration::from_secs(file.inner.accessed);
+        output
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(accessed)
+                    .set_modified(modified),
+            )
+            .unwrap();
     }
 }
 
@@ -274,6 +306,7 @@ fn walk(
     }
     Ok(())
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArchiveHeader {
     version: u32,
@@ -281,13 +314,9 @@ struct ArchiveHeader {
 }
 
 impl ArchiveHeader {
-    const SIZE: usize = 8;
-
     fn read(reader: &mut dyn Read) -> io::Result<Self> {
-        let mut buf = [0u8; Self::SIZE];
-        reader.read_exact(&mut buf)?;
-        let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let file_count = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let version = reader.read_u32::<LittleEndian>()?;
+        let file_count = reader.read_u32::<LittleEndian>()?;
         Ok(Self {
             version,
             file_count,
@@ -295,16 +324,10 @@ impl ArchiveHeader {
     }
 
     fn write(self, writer: &mut dyn Write) -> io::Result<()> {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.version.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.file_count.to_le_bytes());
-        writer.write_all(&buf)?;
+        writer.write_all(&self.version.to_le_bytes())?;
+        writer.write_all(&self.file_count.to_le_bytes())?;
         Ok(())
     }
-}
-
-lazy_static::lazy_static! {
-    pub static ref BROTLI_ENC_PARAMS: brotli::enc::BrotliEncoderParams = brotli::enc::BrotliEncoderParams::default();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -340,149 +363,97 @@ impl std::str::FromStr for DataCompression {
     }
 }
 
-/// FileHeader
-///
-/// Layout:
-///
-/// | Information            |   Size in bytes   |
-/// | ---------------------- | ----------------- |
-/// | mode:                  | 4                 |
-/// | name_len:              | 3                 |
-/// | data_compression:      | 1                 |
-/// | data_uncompressed_len  | 8                 |
-/// | data_len:              | 8                 |
-/// | name:                  | name_len          |
-/// | data:                  | data_len          |
 #[derive(Debug, Default, Clone, Copy)]
 struct FileHeader {
+    modified: u64,
+    accessed: u64,
     /// The UNIX file permissions
     mode: u32,
-    /// Data compression takes up the higher 8 bits, where the lower 24 are for name length.
-    data_compression_and_name_len: u32,
+    name_len: u16,
+    data_compression: u8,
     /// The size of the file data prior to compression, if any has been applied.
-    data_uncompressed_len: u64,
+    uncompressed_len: u64,
     /// The size of the file data within the archive
-    data_len: u64,
-    // name: &'a [u8],
-    // data: &'a [u8],
+    len: u64,
 }
 
 impl FileHeader {
-    pub const SIZE: usize = 24;
-    #[inline]
-    fn new(
-        mode: u32,
-        name_len: u32,
-        data_compression: DataCompression,
-        data_uncompressed_len: u64,
-        data_len: u64,
-    ) -> Self {
-        Self {
-            mode,
-            data_compression_and_name_len: data_compression as u32 | name_len << 8,
-            data_uncompressed_len,
-            data_len,
-        }
-    }
-
-    fn read(reader: &mut dyn Read) -> std::io::Result<Self> {
-        let mut s = Self::default();
-        let mut file_header_buf = [0u8; Self::SIZE];
-        reader.read_exact(&mut file_header_buf)?;
-
-        s.mode = u32::from_le_bytes(file_header_buf[0..4].try_into().unwrap());
-        s.data_compression_and_name_len =
-            u32::from_le_bytes(file_header_buf[4..8].try_into().unwrap());
-        s.data_uncompressed_len = u64::from_le_bytes(file_header_buf[8..16].try_into().unwrap());
-        s.data_len = u64::from_le_bytes(file_header_buf[16..24].try_into().unwrap());
-        Ok(s)
-    }
-
     fn write(self, writer: &mut dyn Write) -> std::io::Result<()> {
+        writer.write_all(&self.modified.to_le_bytes())?;
+        writer.write_all(&self.accessed.to_le_bytes())?;
         writer.write_all(&self.mode.to_le_bytes())?;
-        writer.write_all(&self.data_compression_and_name_len.to_le_bytes())?;
-        writer.write_all(&self.data_uncompressed_len.to_le_bytes())?;
-        writer.write_all(&self.data_len.to_le_bytes())?;
+        writer.write_all(&self.name_len.to_le_bytes())?;
+        writer.write_all(&self.data_compression.to_le_bytes())?;
+        writer.write_all(&self.uncompressed_len.to_le_bytes())?;
+        writer.write_all(&self.len.to_le_bytes())?;
         Ok(())
     }
 
-    #[inline]
-    fn data_compression(&self) -> DataCompression {
-        DataCompression::try_from(self.data_compression_and_name_len as u8).unwrap()
-    }
+    fn read(reader: &mut dyn Read) -> std::io::Result<Self> {
+        let modified = reader.read_u64::<LittleEndian>()?;
+        let accessed = reader.read_u64::<LittleEndian>()?;
+        let mode = reader.read_u32::<LittleEndian>()?;
+        let name_len = reader.read_u16::<LittleEndian>()?;
+        let data_compression = reader.read_u8()?;
+        let uncompressed_len = reader.read_u64::<LittleEndian>()?;
+        let len = reader.read_u64::<LittleEndian>()?;
 
-    #[inline]
-    fn name_len(&self) -> u32 {
-        self.data_compression_and_name_len >> 8
+        Ok(Self {
+            modified,
+            accessed,
+            mode,
+            data_compression,
+            name_len,
+            uncompressed_len,
+            len,
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 struct FileHeaderRepr {
-    mode: u32,
-    data_compression: DataCompression,
-    data_uncompressed_len: u64,
-    data_len: u64,
-
+    inner: FileHeader,
     name: String,
     data: Vec<u8>,
 }
 
 impl FileHeaderRepr {
-    fn new(
-        mode: u32,
-        data_compression: DataCompression,
-        data_uncompressed_len: u64,
-        data_len: u64,
-        name: String,
-        data: Vec<u8>,
-    ) -> Self {
+    fn new(header: FileHeader, name: String, data: Vec<u8>) -> Self {
         Self {
-            mode,
-            data_compression,
-            data_uncompressed_len,
-            data_len,
+            inner: header,
             name,
             data,
         }
     }
+
     fn read(reader: &mut dyn Read, skip_data: bool) -> std::io::Result<Self> {
         let header = FileHeader::read(reader)?;
-        let mut name = vec![0u8; header.name_len() as usize];
-        reader.read_exact(&mut name)?;
-        let name = String::from_utf8(name).unwrap();
+        let name = {
+            let mut name = vec![0u8; header.name_len as usize];
+            reader.read_exact(&mut name)?;
+            String::from_utf8(name).unwrap()
+        };
 
         let data = if skip_data {
-            io::copy(&mut reader.take(header.data_len as u64), &mut io::sink())?;
+            io::copy(&mut reader.take(header.len as u64), &mut io::sink())?;
             vec![]
         } else {
-            let mut data = vec![0u8; header.data_len as usize];
+            let mut data = vec![0u8; header.len as usize];
             reader.read_exact(&mut data)?;
             data
         };
 
         Ok(Self {
-            mode: header.mode,
-            data_compression: header.data_compression(),
-            data_uncompressed_len: header.data_uncompressed_len,
-            data_len: header.data_len,
+            inner: header,
             name,
             data,
         })
     }
 
     fn write(&self, writer: &mut dyn Write) -> std::io::Result<()> {
-        let header = FileHeader::new(
-            self.mode,
-            self.name.len() as u32,
-            self.data_compression,
-            self.data_uncompressed_len,
-            self.data_len,
-        );
-        header.write(writer)?;
+        self.inner.write(writer)?;
         writer.write_all(self.name.as_bytes())?;
         writer.write_all(&self.data)?;
-
         Ok(())
     }
 }
