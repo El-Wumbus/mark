@@ -1,14 +1,18 @@
-use std::io::{BufReader, BufWriter, Read as _, Write as _};
-use std::str::FromStr;
+//! A simple archival format.
+//!
+//! For future editors:
+//! Remember to always output debugging messages to stderr and not to stdout.
+
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::process::exit;
+use std::str::FromStr;
 
 // TODO: parse .gitignore files and use them to ignore files by default
 //       https://git-scm.com/docs/gitignore
 //
-// TODO: Input/Output on stdin/stdout by default
 // TODO: Unarchival/unpacking
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 struct Opts {
     /// Input file -- stdin if omitted.
     input: Option<String>,
@@ -32,15 +36,33 @@ fn parse_flags(args: Vec<String>) -> (Opts, Vec<String>) {
         }
 
         match arg.as_str() {
-            "-" => {
+            "--" => {
                 positionals.extend_from_slice(&args.collect::<Vec<_>>());
                 break;
             }
-            "include-dotfiles" => {
+            "-i" | "-input" => {
+                let Some(input) = args.next() else {
+                    eprintln!("After -input, I expected a file path!");
+                    exit(1);
+                };
+                opts.input = Some(input);
+            }
+            "-o" | "-output" => {
+                let Some(output) = args.next() else {
+                    eprintln!("After -output, I expected a file path!");
+                    exit(1);
+                };
+                opts.output = Some(output);
+            }
+            "-include-dotfiles" => {
                 opts.include_dotfiles = true;
             }
-            "compress" => {
-                let Some(compression_method) = args.next().map(|x|x.to_lowercase()).and_then(|x|DataCompression::from_str(&x).ok()) else {
+            "-compress" => {
+                let Some(compression_method) = args
+                    .next()
+                    .map(|x| x.to_lowercase())
+                    .and_then(|x| DataCompression::from_str(&x).ok())
+                else {
                     eprintln!("I expected a valid compression type after -compress");
                     exit(1);
                 };
@@ -65,26 +87,11 @@ fn main() {
         exit(1);
     };
 
-    let input: &dyn std::io::BufRead = match opts.input.as_deref() {
-        Some(input) => &BufReader::new(std::fs::File::open(input).unwrap()),
-        None => &BufReader::new(std::io::stdin().lock()),
-    };
-    let output: &dyn std::io::Write = match opts.output.as_deref() {
-        Some(output) => &BufWriter::new(std::fs::File::create(output).unwrap()),
-        None => &BufWriter::new(std::io::stdout().lock()),
-    };
-
+    dbg!(&opts);
     match subcommand.as_str() {
-        "archive" => archive(opts, &positionals.collect::<Vec<_>>()),
-        "read-archive" => {
-            for arg in positionals {
-                read_archive(&arg);
-            }
-        }
-        "unarchive" => {
-            for arg in positionals {
-            }
-        }
+        "pack" => pack(opts, &positionals.collect::<Vec<_>>()),
+        "unpack" => unpack(opts),
+        "read" => read_archive(opts),
         _ => {
             eprintln!("Invalid subcommand!");
             exit(1);
@@ -92,40 +99,14 @@ fn main() {
     }
 }
 
-fn read_archive(archive: &str) {
-    let mut files = vec![];
-
-    let mut archive = BufReader::new(std::fs::File::open(archive).unwrap());
-
-    let mut header_buf = [0u8; ArchiveHeader::SIZE];
-    archive.read_exact(&mut header_buf).unwrap();
-    let header = ArchiveHeader::from_le_bytes(header_buf);
-
-    for _ in 0..header.file_count {
-        let file = FileHeaderRepr::read(&mut archive, false).unwrap();
-        // Skip past the file data
-        
-        files.push(file);
-    }
-
-    println!(
-        "Format version: {}; File count: {}",
-        header.version, header.file_count
-    );
-    for file in files.iter() {
-        println!(
-            "{} :: {{ mode = {:o}; uncompressed_len = {}; compressed_len = {}; compression_method = {:?} }}",
-            file.name, file.mode, file.data_uncompressed_len, file.data_len,  file.data_compression,
-        );
-    }
-}
-
-fn unarchive() {
-    todo!()
-}
-
-fn archive(opts: Opts, args: &[String]) {
+fn pack(opts: Opts, args: &[String]) {
     use std::os::unix::fs::MetadataExt;
+
+    let output: &mut dyn Write = match opts.output.as_deref() {
+        Some(output) => &mut BufWriter::new(std::fs::File::create(output).unwrap()),
+        None => &mut BufWriter::new(std::io::stdout().lock()),
+    };
+
     if args.is_empty() {
         eprintln!("Expected one or more files or directories to archive!");
         exit(1);
@@ -167,30 +148,28 @@ fn archive(opts: Opts, args: &[String]) {
     files.sort_by(|l, r| l.1.cmp(&r.1));
     files.dedup_by(|l, r| l.1 == r.1);
 
-    let mut archive = BufWriter::new(std::fs::File::create("test.mark").unwrap());
-    archive
-        .write_all(
-            &ArchiveHeader {
-                version: 0,
-                file_count: files.len() as u32,
-            }
-            .to_le_bytes(),
-        )
-        .unwrap();
-
+    ArchiveHeader {
+        version: 0,
+        file_count: files.len() as u32,
+    }
+    .write(output)
+    .unwrap();
     for (name, path) in files {
         let mut buf = vec![];
         let metadata = std::fs::metadata(&path).unwrap();
         let uncompressed_size = metadata.len();
         let compressed_size = match opts.compression_method {
-            DataCompression::None => {
-                std::fs::File::open(&path).unwrap().read_to_end(&mut buf).unwrap()
-            }
-            DataCompression::Brotli => {
-                brotli::enc::reader::CompressorReader::with_params(
-                    std::fs::File::open(&path).unwrap(), 4096, &BROTLI_ENC_PARAMS
-                ).read_to_end(&mut buf).unwrap()
-            }
+            DataCompression::None => std::fs::File::open(&path)
+                .unwrap()
+                .read_to_end(&mut buf)
+                .unwrap(),
+            DataCompression::Brotli => brotli::enc::reader::CompressorReader::with_params(
+                std::fs::File::open(&path).unwrap(),
+                8128,
+                &BROTLI_ENC_PARAMS,
+            )
+            .read_to_end(&mut buf)
+            .unwrap(),
         };
 
         let f = FileHeaderRepr::new(
@@ -201,9 +180,74 @@ fn archive(opts: Opts, args: &[String]) {
             name,
             buf,
         );
-        eprintln!("Writing: {} :: {{ mode = {:o}; compression = {:?}; uncompressed_len = {}; len = {} }}",
-            f.name, f.mode, f.data_compression, f.data_uncompressed_len, f.data_len);
-        f.write(&mut archive).unwrap();
+        eprintln!(
+            "Writing: {} :: {{ mode = {:o}; compression = {:?}; uncompressed_len = {}; len = {} }}",
+            f.name, f.mode, f.data_compression, f.data_uncompressed_len, f.data_len
+        );
+        f.write(output).unwrap();
+    }
+}
+
+fn read_archive(opts: Opts) {
+    let input: &mut dyn Read = match opts.input.as_deref() {
+        Some(input) => &mut BufReader::new(std::fs::File::open(input).unwrap()),
+        None => &mut BufReader::new(std::io::stdin().lock()),
+    };
+
+    let mut files = vec![];
+    
+    let header = ArchiveHeader::read(input).unwrap();
+    for _ in 0..header.file_count {
+        let file = FileHeaderRepr::read(input, true).unwrap();
+        files.push(file);
+    }
+
+    eprintln!(
+        "Format version: {}; File count: {}",
+        header.version, header.file_count
+    );
+    for file in files.iter() {
+        eprintln!(
+            "{} :: {{ mode = {:o}; uncompressed_len = {}; compressed_len = {}; compression_method = {:?} }}",
+            file.name, file.mode, file.data_uncompressed_len, file.data_len,  file.data_compression,
+        );
+    }
+}
+
+fn unpack(opts: Opts) {
+    let input: &mut dyn Read = match opts.input.as_deref() {
+        Some(input) => &mut BufReader::new(std::fs::File::open(input).unwrap()),
+        None => &mut BufReader::new(std::io::stdin().lock()),
+    };
+    let output_dir = match opts.output {
+        Some(o) => std::path::PathBuf::from(o),
+        None => std::env::current_dir().unwrap(),
+    };
+    
+    let header = ArchiveHeader::read(input).unwrap();
+    for _ in 0..header.file_count {
+        let file = FileHeaderRepr::read(input, false).unwrap();
+        let file_path = output_dir.join(&file.name);
+        if file_path.exists() {
+            eprintln!("Not overwriting \"{}\"!", file_path.display());
+            continue;
+        }
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+        }
+        let mut output = std::fs::File::create(&file_path).unwrap();
+
+        eprintln!("Writing \"{}\" -> \"{}\"", file.name, file_path.display());
+        match file.data_compression {
+            DataCompression::None => {
+                output.write_all(&file.data).unwrap();
+            }, 
+            DataCompression::Brotli => {
+                brotli::DecompressorWriter::new(output, 8128).write_all(&file.data).unwrap();
+            }
+        }
     }
 }
 
@@ -238,28 +282,29 @@ struct ArchiveHeader {
 
 impl ArchiveHeader {
     const SIZE: usize = 8;
-    #[inline]
-    fn to_le_bytes(self) -> [u8; Self::SIZE] {
-        let mut a = [0u8; Self::SIZE];
-        a[0..4].copy_from_slice(&self.version.to_le_bytes());
-        a[4..8].copy_from_slice(&self.file_count.to_le_bytes());
-        a
-    }
 
-    #[inline]
-    fn from_le_bytes(a: [u8; Self::SIZE]) -> Self {
-        let mut v = [0u8; 4];
-        v.copy_from_slice(&a[0..4]);
-        let mut fc = [0u8; 4];
-        fc.copy_from_slice(&a[4..8]);
-        let version = u32::from_le_bytes(v);
-        let file_count = u32::from_le_bytes(fc);
-
-        Self {
+    fn read(reader: &mut dyn Read) -> io::Result<Self> {
+        let mut buf = [0u8; Self::SIZE];
+        reader.read_exact(&mut buf)?;
+        let version = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let file_count = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        Ok(Self {
             version,
             file_count,
-        }
+        })
     }
+
+    fn write(self, writer: &mut dyn Write) -> io::Result<()> {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.version.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.file_count.to_le_bytes());
+        writer.write_all(&buf)?;
+        Ok(())
+    }
+}
+
+lazy_static::lazy_static! {
+    pub static ref BROTLI_ENC_PARAMS: brotli::enc::BrotliEncoderParams = brotli::enc::BrotliEncoderParams::default();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -270,12 +315,6 @@ enum DataCompression {
     Brotli = 1,
 }
 
-    lazy_static::lazy_static! {
-        pub static ref BROTLI_ENC_PARAMS: brotli::enc::BrotliEncoderParams = {
-            
-        brotli::enc::BrotliEncoderParams::default()
-        };
-    }
 impl TryFrom<u8> for DataCompression {
     type Error = ();
     fn try_from(x: u8) -> Result<DataCompression, Self::Error> {
@@ -296,7 +335,7 @@ impl std::str::FromStr for DataCompression {
             "default" => Self::default(),
             "none" => Self::None,
             "brotli" => Self::Brotli,
-            _=> return Err("unspported compression format")
+            _ => return Err("unspported compression format"),
         })
     }
 }
@@ -314,7 +353,7 @@ impl std::str::FromStr for DataCompression {
 /// | data_len:              | 8                 |
 /// | name:                  | name_len          |
 /// | data:                  | data_len          |
-#[derive(Debug,Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 struct FileHeader {
     /// The UNIX file permissions
     mode: u32,
@@ -346,19 +385,20 @@ impl FileHeader {
         }
     }
 
-    fn read<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+    fn read(reader: &mut dyn Read) -> std::io::Result<Self> {
         let mut s = Self::default();
         let mut file_header_buf = [0u8; Self::SIZE];
         reader.read_exact(&mut file_header_buf)?;
 
         s.mode = u32::from_le_bytes(file_header_buf[0..4].try_into().unwrap());
-        s.data_compression_and_name_len = u32::from_le_bytes(file_header_buf[4..8].try_into().unwrap());
+        s.data_compression_and_name_len =
+            u32::from_le_bytes(file_header_buf[4..8].try_into().unwrap());
         s.data_uncompressed_len = u64::from_le_bytes(file_header_buf[8..16].try_into().unwrap());
         s.data_len = u64::from_le_bytes(file_header_buf[16..24].try_into().unwrap());
         Ok(s)
     }
 
-    fn write<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
+    fn write(self, writer: &mut dyn Write) -> std::io::Result<()> {
         writer.write_all(&self.mode.to_le_bytes())?;
         writer.write_all(&self.data_compression_and_name_len.to_le_bytes())?;
         writer.write_all(&self.data_uncompressed_len.to_le_bytes())?;
@@ -375,7 +415,6 @@ impl FileHeader {
     fn name_len(&self) -> u32 {
         self.data_compression_and_name_len >> 8
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -390,17 +429,31 @@ struct FileHeaderRepr {
 }
 
 impl FileHeaderRepr {
-    fn new(mode: u32, data_compression: DataCompression, data_uncompressed_len: u64, data_len: u64, name: String, data: Vec<u8>) -> Self {
-        Self {mode, data_compression, data_uncompressed_len, data_len, name, data}
+    fn new(
+        mode: u32,
+        data_compression: DataCompression,
+        data_uncompressed_len: u64,
+        data_len: u64,
+        name: String,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            mode,
+            data_compression,
+            data_uncompressed_len,
+            data_len,
+            name,
+            data,
+        }
     }
-    fn read<R: std::io::Read + std::io::Seek>(reader: &mut R, skip_data: bool) -> std::io::Result<Self> {
+    fn read(reader: &mut dyn Read, skip_data: bool) -> std::io::Result<Self> {
         let header = FileHeader::read(reader)?;
         let mut name = vec![0u8; header.name_len() as usize];
         reader.read_exact(&mut name)?;
         let name = String::from_utf8(name).unwrap();
 
         let data = if skip_data {
-            reader.seek_relative(header.data_len as i64)?;
+            io::copy(&mut reader.take(header.data_len as u64), &mut io::sink())?;
             vec![]
         } else {
             let mut data = vec![0u8; header.data_len as usize];
@@ -418,7 +471,7 @@ impl FileHeaderRepr {
         })
     }
 
-    fn write<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    fn write(&self, writer: &mut dyn Write) -> std::io::Result<()> {
         let header = FileHeader::new(
             self.mode,
             self.name.len() as u32,
